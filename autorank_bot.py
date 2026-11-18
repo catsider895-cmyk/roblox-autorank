@@ -1,14 +1,17 @@
 """
 Roblox Group Auto-Rank Bot
 --------------------------
-Watches your Roblox group and automatically moves every new member
-(who lands in the default "entry" role) to the role you choose.
-Optionally it also auto-accepts pending join requests.
+Gives everyone who recently joined your Roblox group the role you choose
+(TARGET_ROLE), no matter which role Roblox put them in.
 
-Uses the official Roblox Open Cloud API with an API key, so no account
-cookie is needed. Only uses the Python standard library.
+- Only touches members who joined in the last NEW_MEMBER_MINUTES (default 60),
+  so existing members are never changed.
+- Never touches admin/owner roles (rank PROTECTED_RANK and above, default 254).
+- Optionally auto-accepts pending join requests (AUTO_ACCEPT=true).
 
-Run:  python autorank_bot.py
+Uses the official Roblox Open Cloud API with an API key. Standard library only.
+Run locally:  python autorank_bot.py   (uses config.json)
+GitHub Actions: set RUN_ONCE=true and the settings as environment variables.
 """
 
 import json
@@ -17,6 +20,7 @@ import time
 import urllib.error
 import urllib.parse
 import urllib.request
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 
 BASE = "https://apis.roblox.com/cloud/v2"
@@ -30,19 +34,23 @@ def load_config():
             "api_key": os.environ["ROBLOX_API_KEY"],
             "group_id": os.environ.get("GROUP_ID"),
             "target_role": os.environ.get("TARGET_ROLE"),
-            "entry_role": os.environ.get("ENTRY_ROLE") or None,
             "auto_accept_join_requests": os.environ.get("AUTO_ACCEPT", "").lower() == "true",
         }
+        if os.environ.get("NEW_MEMBER_MINUTES"):
+            cfg["new_member_minutes"] = int(os.environ["NEW_MEMBER_MINUTES"])
+        if os.environ.get("PROTECTED_RANK"):
+            cfg["protected_rank"] = int(os.environ["PROTECTED_RANK"])
     elif CONFIG_FILE.exists():
         cfg = json.loads(CONFIG_FILE.read_text(encoding="utf-8"))
     else:
         raise SystemExit(f"Missing {CONFIG_FILE.name}. Copy config.example.json to config.json and fill it in.")
     for key in ("api_key", "group_id", "target_role"):
         if not cfg.get(key):
-            raise SystemExit(f"config.json: '{key}' is required.")
+            raise SystemExit(f"Setting '{key}' is required.")
     cfg.setdefault("poll_seconds", 30)
     cfg.setdefault("auto_accept_join_requests", False)
-    cfg.setdefault("entry_role", None)  # None = lowest rank above Guest (Roblox default)
+    cfg.setdefault("new_member_minutes", 60)
+    cfg.setdefault("protected_rank", 254)
     return cfg
 
 
@@ -90,9 +98,8 @@ class RobloxGroupAPI:
     def roles(self):
         return list(self._paginate("/roles", "groupRoles"))
 
-    def members_in_role(self, role_id):
-        role_path = f"groups/{self.group_id}/roles/{role_id}"
-        return self._paginate("/memberships", "groupMemberships", {"filter": f"role == '{role_path}'"})
+    def members(self):
+        return self._paginate("/memberships", "groupMemberships")
 
     def set_role(self, membership_path, role_id):
         membership_id = membership_path.rsplit("/", 1)[-1]
@@ -111,16 +118,58 @@ class RobloxGroupAPI:
 
 
 def find_role(roles, wanted):
-    """Match a role by name (case-insensitive), rank number, or role ID."""
+    """Match a role by role ID, name (case-insensitive) or rank number."""
     wanted_str = str(wanted).strip().lower()
+    for r in roles:
+        if str(r.get("id")) == wanted_str:
+            return r
     for r in roles:
         if r.get("displayName", "").lower() == wanted_str:
             return r
-    for r in roles:
-        if str(r.get("rank")) == wanted_str or str(r.get("id")) == wanted_str:
-            return r
-    names = ", ".join(f"{r['displayName']} (rank {r['rank']})" for r in roles)
-    raise SystemExit(f"Role '{wanted}' not found. Available roles: {names}")
+    matches = [r for r in roles if str(r.get("rank")) == wanted_str]
+    if len(matches) == 1:
+        return matches[0]
+    if len(matches) > 1:
+        raise SystemExit(f"More than one role has rank {wanted}. Use the role ID instead.")
+    raise SystemExit(f"Role '{wanted}' not found. Use one of the role IDs listed above.")
+
+
+def parse_time(value):
+    """Parse an RFC 3339 time like 2026-11-18T12:34:56.789Z."""
+    value = value.replace("Z", "").split("+")[0]
+    main = value.split(".")[0]
+    return datetime.strptime(main, "%Y-%m-%dT%H:%M:%S").replace(tzinfo=timezone.utc)
+
+
+def run_once(api, cfg, target, roles_by_id):
+    if cfg["auto_accept_join_requests"]:
+        for jr in list(api.join_requests()):
+            api.accept_join_request(jr["path"])
+            print(f"  [+] Accepted join request from {jr.get('user')}")
+
+    cutoff = datetime.now(timezone.utc) - timedelta(minutes=cfg["new_member_minutes"])
+    ranked = 0
+    no_time = 0
+    for m in list(api.members()):
+        created = m.get("createTime")
+        if not created:
+            no_time += 1
+            continue
+        if parse_time(created) < cutoff:
+            continue  # not a new member -> leave alone
+        role_id = m.get("role", "").rsplit("/", 1)[-1]
+        if role_id == str(target["id"]):
+            continue  # already has the right role
+        current = roles_by_id.get(role_id)
+        if current and current["rank"] >= cfg["protected_rank"]:
+            continue  # never touch admins/owner
+        api.set_role(m["path"], target["id"])
+        ranked += 1
+        name = current["displayName"] if current else role_id
+        print(f"  [*] {m.get('user')}: {name} -> {target['displayName']}")
+    if no_time:
+        print(f"  [!] {no_time} member(s) had no join time from Roblox and were skipped.")
+    return ranked
 
 
 def main():
@@ -131,47 +180,23 @@ def main():
     print("Roles in this group:")
     for r in roles:
         print(f"  rank {r['rank']:>3}  id {r['id']:<12}  {r['displayName']}")
-    print(f"Settings: target_role={cfg['target_role']!r}  entry_role={cfg['entry_role']!r}")
 
     target = find_role(roles, cfg["target_role"])
-    if cfg["entry_role"] is not None:
-        entry = find_role(roles, cfg["entry_role"])
-    else:
-        entry = next(r for r in roles if r["rank"] > 0)  # default member role
+    roles_by_id = {str(r["id"]): r for r in roles}
+    print(f"Giving '{target['displayName']}' to everyone who joined in the last "
+          f"{cfg['new_member_minutes']} min (ranks {cfg['protected_rank']}+ are never changed).")
 
-    if entry["id"] == target["id"]:
-        raise SystemExit(
-            f"New members start in '{entry['displayName']}' (rank {entry['rank']}), and target_role "
-            f"points to that same role - nothing to do. Set TARGET_ROLE to a higher rank from the list above."
-        )
-
-    print(f"Group {cfg['group_id']}: moving new members from "
-          f"'{entry['displayName']}' -> '{target['displayName']}' every {cfg['poll_seconds']}s")
-    if cfg["auto_accept_join_requests"]:
-        print("Auto-accepting join requests: ON")
-
-    run_once = os.environ.get("RUN_ONCE", "").lower() in ("1", "true")
-
+    once = os.environ.get("RUN_ONCE", "").lower() in ("1", "true")
     while True:
         try:
-            if cfg["auto_accept_join_requests"]:
-                for jr in list(api.join_requests()):
-                    api.accept_join_request(jr["path"])
-                    print(f"  [+] Accepted join request from {jr.get('user')}")
-
-            ranked = 0
-            for m in list(api.members_in_role(entry["id"])):
-                api.set_role(m["path"], target["id"])
-                ranked += 1
-                print(f"  [*] Ranked {m.get('user')} -> {target['displayName']}")
-            if run_once:
+            ranked = run_once(api, cfg, target, roles_by_id)
+            if once:
                 print(f"Done. Ranked {ranked} member(s).")
                 return
-        except Exception as e:  # keep the bot alive on errors
-            if run_once:
+        except Exception as e:
+            if once:
                 raise SystemExit(f"Error: {e}")  # makes the GitHub run show as failed
             print(f"  [!] Error: {e}")
-
         time.sleep(cfg["poll_seconds"])
 
 
