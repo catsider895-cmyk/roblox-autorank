@@ -153,7 +153,7 @@ def run_once(api, cfg, target, roles_by_id):
     members = list(api.members())
     print(f"  Checked {len(members)} member(s). Newest joiners:")
     newest = sorted((m for m in members if m.get("createTime")),
-                    key=lambda m: m["createTime"], reverse=True)[:5]
+                    key=lambda m: m["createTime"], reverse=True)[:20]
     for m in newest:
         r = roles_by_id.get(m.get("role", "").rsplit("/", 1)[-1])
         print(f"    {m.get('user')}  joined {m['createTime']}  role: {r['displayName'] if r else m.get('role')}")
