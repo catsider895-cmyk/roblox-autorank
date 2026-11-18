@@ -1,0 +1,29 @@
+name: Auto-rank new group members
+
+on:
+  schedule:
+    - cron: "*/5 * * * *"   # every 5 minutes (GitHub may start it a few minutes late)
+  workflow_dispatch:         # adds a "Run workflow" button for manual runs
+
+concurrency:
+  group: autorank
+  cancel-in-progress: false
+
+jobs:
+  rank:
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - name: Rank new members
+        env:
+          RUN_ONCE: "true"
+          ROBLOX_API_KEY: ${{ secrets.ROBLOX_API_KEY }}
+          GROUP_ID: ${{ vars.GROUP_ID }}
+          TARGET_ROLE: ${{ vars.TARGET_ROLE }}
+          ENTRY_ROLE: ${{ vars.ENTRY_ROLE }}
+          AUTO_ACCEPT: ${{ vars.AUTO_ACCEPT }}
+        run: python autorank_bot.py
