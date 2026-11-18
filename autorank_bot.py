@@ -128,6 +128,11 @@ def main():
     api = RobloxGroupAPI(cfg["api_key"], cfg["group_id"])
 
     roles = sorted(api.roles(), key=lambda r: r["rank"])
+    print("Roles in this group:")
+    for r in roles:
+        print(f"  rank {r['rank']:>3}  id {r['id']:<12}  {r['displayName']}")
+    print(f"Settings: target_role={cfg['target_role']!r}  entry_role={cfg['entry_role']!r}")
+
     target = find_role(roles, cfg["target_role"])
     if cfg["entry_role"] is not None:
         entry = find_role(roles, cfg["entry_role"])
@@ -135,7 +140,10 @@ def main():
         entry = next(r for r in roles if r["rank"] > 0)  # default member role
 
     if entry["id"] == target["id"]:
-        raise SystemExit("entry_role and target_role are the same role - nothing to do.")
+        raise SystemExit(
+            f"New members start in '{entry['displayName']}' (rank {entry['rank']}), and target_role "
+            f"points to that same role - nothing to do. Set TARGET_ROLE to a higher rank from the list above."
+        )
 
     print(f"Group {cfg['group_id']}: moving new members from "
           f"'{entry['displayName']}' -> '{target['displayName']}' every {cfg['poll_seconds']}s")
